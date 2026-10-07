@@ -72,8 +72,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.11", cache: pip }
+      # apt hung for 2.5 h on 5 of 72 runners (lock held by a background update, or a stalled
+      # mirror). Each attempt is now killed after 4 min and retried; apt waits at most 2 min for
+      # the lock; and the step gives up at 15 min so a bad runner fails fast and can be re-run.
       - name: Install eccodes (pygrib needs the C library)
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libeccodes0 libeccodes-dev
+        timeout-minutes: 15
+        run: |
+          APT="-o DPkg::Lock::Timeout=120 -o Acquire::Retries=3 -o Acquire::http::Timeout=30"
+          for i in 1 2 3; do
+            sudo timeout 240 apt-get $APT update -qq &&
+            sudo timeout 240 apt-get $APT install -y -qq libeccodes0 libeccodes-dev && exit 0
+            echo "apt attempt $i failed or hung; retrying in 20 s"; sleep 20
+          done
+          exit 1
       - run: pip install -r requirements.txt
       - name: Static checks
         run: |
@@ -106,8 +117,19 @@ jobs:
         with: { pattern: "climo-*", merge-multiple: true, path: site/data }
       - uses: actions/setup-python@v5
         with: { python-version: "3.11", cache: pip }
-      - name: Install eccodes
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libeccodes0 libeccodes-dev
+      # apt hung for 2.5 h on 5 of 72 runners (lock held by a background update, or a stalled
+      # mirror). Each attempt is now killed after 4 min and retried; apt waits at most 2 min for
+      # the lock; and the step gives up at 15 min so a bad runner fails fast and can be re-run.
+      - name: Install eccodes (pygrib needs the C library)
+        timeout-minutes: 15
+        run: |
+          APT="-o DPkg::Lock::Timeout=120 -o Acquire::Retries=3 -o Acquire::http::Timeout=30"
+          for i in 1 2 3; do
+            sudo timeout 240 apt-get $APT update -qq &&
+            sudo timeout 240 apt-get $APT install -y -qq libeccodes0 libeccodes-dev && exit 0
+            echo "apt attempt $i failed or hung; retrying in 20 s"; sleep 20
+          done
+          exit 1
       - run: pip install -r requirements.txt
       - name: Cache cartopy data
         uses: actions/cache@v4
