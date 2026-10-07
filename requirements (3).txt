@@ -1,0 +1,8 @@
+numpy
+scipy
+requests
+pygrib
+matplotlib
+cartopy
+Pillow
+netCDF4
