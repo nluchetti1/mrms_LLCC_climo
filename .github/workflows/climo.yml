@@ -1,0 +1,129 @@
+name: CloudScope climatology
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "First month (YYYY-MM). The MRMS v12 archive begins 2020-10."
+        default: "2020-10"
+      end:
+        description: "Last month (YYYY-MM). Blank = the last complete month."
+        default: ""
+      rerun_all:
+        description: "Re-score months already published (e.g. after a classifier change)"
+        type: boolean
+        default: false
+  # The 3rd of each month: score the month just finished and re-merge.
+  schedule:
+    - cron: "0 6 3 * *"
+
+permissions:
+  contents: write
+
+# Month files live in the published site under data/, not as artifacts - artifacts expire after
+# 90 days, and the merge needs every month. So each run scores only the months not already there.
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      months: ${{ steps.p.outputs.months }}
+      count: ${{ steps.p.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+        continue-on-error: true
+        with: { ref: gh-pages, path: site }
+      - id: p
+        env:
+          START: ${{ inputs.start || '2020-10' }}
+          END: ${{ inputs.end }}
+          RERUN: ${{ inputs.rerun_all || false }}
+        run: |
+          python3 - <<'PY'
+          import datetime, json, os, glob
+          today = datetime.date.today()
+          last_full = (today.replace(day=1) - datetime.timedelta(days=1))
+          end = os.environ.get("END") or f"{last_full:%Y-%m}"
+          y, m = map(int, os.environ["START"].split("-")); ey, em = map(int, end.split("-"))
+          have = {os.path.basename(f)[:6] for f in glob.glob("site/data/*.npz")}
+          rerun = os.environ.get("RERUN", "false").lower() == "true"
+          out = []
+          while (y, m) <= (ey, em):
+              ym = f"{y:04d}{m:02d}"
+              if rerun or ym not in have:
+                  out.append(f"{y:04d}-{m:02d}")
+              m += 1
+              if m == 13: y, m = y + 1, 1
+          print(f"{len(out)} month(s) to score: {out}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fp:
+              fp.write(f"months={json.dumps(out)}\ncount={len(out)}\n")
+          PY
+
+  score:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        month: ${{ fromJson(needs.plan.outputs.months) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - name: Install eccodes (pygrib needs the C library)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libeccodes0 libeccodes-dev
+      - run: pip install -r requirements.txt
+      - name: Static checks
+        run: |
+          if [ -f _checks.py ]; then python _checks.py climo_run.py && python _checks.py mrms_classify.py; fi
+      # Four processes on the runner's four cores, each a contiguous quarter of the month so the
+      # detached-anvil history still runs in order. Roughly 40 minutes per month.
+      - name: Score ${{ matrix.month }}
+        run: python climo_run.py ${{ matrix.month }} --procs 4 --out out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: climo-${{ matrix.month }}
+          path: out/*.npz
+          retention-days: 7
+
+  merge:
+    needs: [plan, score]
+    # Merge whatever exists even if some months failed - the page reports coverage per year.
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        continue-on-error: true
+        with: { ref: gh-pages, path: site }
+      - name: Ensure site folder
+        run: mkdir -p site/data
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with: { pattern: "climo-*", merge-multiple: true, path: site/data }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - name: Install eccodes
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libeccodes0 libeccodes-dev
+      - run: pip install -r requirements.txt
+      - name: Cache cartopy data
+        uses: actions/cache@v4
+        with: { path: ~/.local/share/cartopy, key: cartopy-ne-10m-v1 }
+      - name: Merge
+        run: python climo_merge.py --inp site/data --site site --web web
+      # One-commit gh-pages, force-pushed, same as the live site: the repo never accumulates
+      # history, while data/ carries every month forward.
+      - name: Publish
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+        run: |
+          cd site
+          rm -rf .git
+          git init -q && git checkout -q -b gh-pages
+          git add -A
+          git -c user.name="cloudscope-bot" -c user.email="actions@users.noreply.github.com" \
+            commit -qm "Climatology $(date -u '+%Y-%m-%d %H:%MZ')"
+          git push -fq "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
+          echo "published $(ls data/*.npz | wc -l) month files"
