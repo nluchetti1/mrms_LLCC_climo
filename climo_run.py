@@ -76,8 +76,19 @@ _listings = {}
 
 
 def _session():
+    """Retries broken connections AND throttling/server errors, with backoff.
+
+    S3 routinely drops idle keep-alive connections ("RemoteDisconnected ... Retrying" in the
+    log) - harmless, retried on a fresh connection. The first version did not retry HTTP status
+    errors at all, so a 503 SlowDown under load from 20 parallel jobs would have skipped the hour
+    instead of waiting and trying again.
+    """
+    from urllib3.util.retry import Retry
+    retry = Retry(total=8, connect=6, read=6, status=6, backoff_factor=0.8,
+                  status_forcelist=(429, 500, 502, 503, 504),
+                  allowed_methods=frozenset(["GET"]), raise_on_status=False)
     s = requests.Session()
-    s.mount("https://", requests.adapters.HTTPAdapter(max_retries=4, pool_maxsize=16))
+    s.mount("https://", requests.adapters.HTTPAdapter(max_retries=retry, pool_maxsize=16))
     s.headers.update(UA)
     return s
 
