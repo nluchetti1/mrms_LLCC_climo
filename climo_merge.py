@@ -57,7 +57,32 @@ def main():
     ap.add_argument("--inp", default="out")
     ap.add_argument("--site", default="site")
     ap.add_argument("--web", default="web")
+    ap.add_argument("--fieldmill", default="fieldmill/fieldmill_hourly.npz")
     a, _ = ap.parse_known_args()
+    # ---- field mills (LLCC 4.1.2), applied here on top of the radar result ------------------------
+    # Any one-minute |E| >= 1000 V/m from a mill within 5 nmi of the pad in the 15 minutes before
+    # the sample -> violating; within 7 nmi -> watch (the usual 2 nmi margin). The prep script
+    # reduced the minute CSVs to per-hour 15-minute maxima. Field-mill EXCEPTIONS in other rules are
+    # not modelled; they only ever relieve a violation, so leaving them out is the conservative side.
+    # When mills are present, only samples WITH mill data count, for every rule - otherwise hours
+    # outside the mill record would look artificially clear and put a step in the statistics.
+    FM = None
+    if a.fieldmill and os.path.exists(a.fieldmill):
+        z = np.load(a.fieldmill, allow_pickle=False)
+        FM = {"hours": z["hours_utc"].astype(np.int64), "max15": z["max15"], "n15": z["n15"],
+              "pex": z["pad_exceed60"], "pva": z["pad_valid60"], "pads": [str(p) for p in z["pads"]],
+              "basis": str(z["time_basis"]),
+              "lat": z["mill_lat"], "lon": z["mill_lon"],
+              "plat": z["pad_lat"], "plon": z["pad_lon"]}
+        def _nm(la1, lo1, la2, lo2):
+            k = np.cos(np.radians((la1 + la2) / 2))
+            return np.hypot((la2 - la1) * 111.32, (lo2 - lo1) * 111.32 * k) / 1.852
+        FM["near5"] = {}; FM["near7"] = {}
+        for i, p in enumerate(FM["pads"]):
+            d = _nm(FM["plat"][i], FM["plon"][i], FM["lat"], FM["lon"])
+            FM["near5"][p] = np.where(d <= 5.0)[0]; FM["near7"][p] = np.where(d <= 7.0)[0]
+        print(f"field mills: {len(FM['lat'])} mills, {len(FM['hours'])} hours; time basis: {FM['basis']}")
+    fm_ex = {}; fm_va = {}; fm_samples = 0
     files = sorted(glob.glob(os.path.join(a.inp, "*.npz")))
     if not files:
         raise SystemExit("no month files found")
@@ -74,10 +99,20 @@ def main():
         if pads is None:
             pads = [str(p) for p in z["pads"]]
             rule_keys = [str(r) for r in z["rule_keys"]]
+            radar_R = len(rule_keys)
+            if FM is not None:
+                rule_keys.append("field_mill")
             P, R = len(pads), len(rule_keys)
             n_pad = np.zeros((P, 365, 24), np.int64)
             red_pad = np.zeros_like(n_pad); watch_pad = np.zeros_like(n_pad)
             rules_pad = np.zeros((P, R, 365, 24), np.int64)
+            # for the headline: by calendar month and local hour, rule and sole-rule counts,
+            # days with any violation, and how often ANY pad is violating
+            mh_n = np.zeros((P, 12, 24), np.int64); mh_red = np.zeros_like(mh_n)
+            mh_watch = np.zeros_like(mh_n)
+            rule_cnt = np.zeros((P, R), np.int64); sole_cnt = np.zeros((P, R), np.int64)
+            red_days = [set() for _ in range(P)]; all_days = set()
+            any_red = any_n = 0
         classifiers.add(str(z["classifier"]))
         ym = os.path.basename(f)[:6]
         coverage[ym] = {"scored": int(len(z["t"])), "planned": int(z["hours_planned"]),
@@ -90,17 +125,63 @@ def main():
             tu = datetime.datetime.fromisoformat(str(ts)).replace(tzinfo=datetime.timezone.utc)
             tl = tu.astimezone(LOCAL)
             d, h = doy_index(tl.date()), tl.hour
+            use = [True] * len(pads)
+            mill_red = [False] * len(pads); mill_watch = [False] * len(pads)
+            if FM is not None:
+                hi = int(np.searchsorted(FM["hours"], int(tu.timestamp())))
+                have_hour = hi < len(FM["hours"]) and FM["hours"][hi] == int(tu.timestamp())
+                for p, name in enumerate(pads):
+                    n5 = FM["near5"].get(name, [])
+                    if not have_hour or len(n5) == 0:
+                        use[p] = False; continue
+                    ok5 = FM["n15"][hi, n5] > 0
+                    if not ok5.any():
+                        use[p] = False; continue
+                    mill_red[p] = bool(((FM["max15"][hi, n5] >= 1000) & ok5).any())
+                    n7 = FM["near7"][name]
+                    mill_watch[p] = bool(((FM["max15"][hi, n7] >= 1000) & (FM["n15"][hi, n7] > 0)).any())
+                    pi = FM["pads"].index(name)
+                    fm_ex[name] = fm_ex.get(name, 0) + int(FM["pex"][hi, pi])
+                    fm_va[name] = fm_va.get(name, 0) + int(FM["pva"][hi, pi])
+                if not any(use):
+                    continue
+                fm_samples += 1
             years.add(tl.year)
             first = tu if first is None or tu < first else first
             last = tu if last is None or tu > last else last
+            # the field-mill verdict folded into this sample's status and rule bits
+            stk = [int(st[k, p]) for p in range(len(pads))]
+            rbk = [int(rb[k, p]) for p in range(len(pads))]
             for p in range(len(pads)):
+                if mill_red[p]:
+                    stk[p] = 2; rbk[p] |= 1 << radar_R
+                elif mill_watch[p] and stk[p] == 0:
+                    stk[p] = 1
+            all_days.add(tl.date()); any_n += 1
+            if any(stk[p] == 2 for p in range(len(pads)) if use[p]):
+                any_red += 1
+            mo_ = tl.month - 1
+            for p in range(len(pads)):
+                if not use[p]:
+                    continue
+                mh_n[p, mo_, h] += 1
+                if stk[p] == 2:
+                    mh_red[p, mo_, h] += 1
+                    red_days[p].add(tl.date())
+                    bits = [b for b in range(len(rule_keys)) if rbk[p] & (1 << b)]
+                    for b in bits:
+                        rule_cnt[p, b] += 1
+                    if len(bits) == 1:
+                        sole_cnt[p, bits[0]] += 1
+                if stk[p] >= 1:
+                    mh_watch[p, mo_, h] += 1
                 n_pad[p, d, h] += 1
-                if st[k, p] == 2:
+                if stk[p] == 2:
                     red_pad[p, d, h] += 1
                     for b in range(len(rule_keys)):
-                        if rb[k, p] & (1 << b):
+                        if rbk[p] & (1 << b):
                             rules_pad[p, b, d, h] += 1
-                if st[k, p] >= 1:
+                if stk[p] >= 1:
                     watch_pad[p, d, h] += 1
         if z["map_red"].ndim == 3 and z["map_red"].shape[1] > 1:
             mo = int(ym[4:6]) - 1
@@ -152,7 +233,54 @@ def main():
         print(f"basemap skipped: {e}")
         domain, rules, sites = None, {k: k for k in rule_keys}, {}
 
+    # ---- the headline: the numbers worth putting in front of leadership --------------------------
+    MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    def pct(a, b):
+        return round(100.0 * a / b, 1) if b else None
+    headline = {"pads": {}, "any_pad_violating_pct": pct(any_red, any_n),
+                "all_clear_pct": None, "days": len(all_days)}
+    for p, name in enumerate(pads):
+        n, red, watch = mh_n[p].sum(), mh_red[p].sum(), mh_watch[p].sum()
+        if not n:
+            continue
+        # worst month and hour, ignoring thin bins
+        with np.errstate(invalid="ignore", divide="ignore"):
+            P_mh = np.where(mh_n[p] >= 20, mh_red[p] / np.maximum(mh_n[p], 1), np.nan)
+        worst = np.unravel_index(np.nanargmax(P_mh), P_mh.shape) if np.isfinite(P_mh).any() else None
+        # best daytime hour in summer (Jun-Sep, 07-19 local), and summer against winter
+        su, wi = [5, 6, 7, 8], [10, 11, 0, 1, 2]
+        su_n, su_red = mh_n[p][su].sum(0), mh_red[p][su].sum(0)
+        day = list(range(7, 20))
+        best = None
+        if su_n[day].sum():
+            with np.errstate(invalid="ignore", divide="ignore"):
+                ph = np.where(su_n >= 20, su_red / np.maximum(su_n, 1), np.nan)
+            cand = [(ph[hh], hh) for hh in day if np.isfinite(ph[hh])]
+            if cand:
+                v, hh = min(cand)
+                best = {"hour": int(hh), "pct": round(100 * float(v), 1)}
+        rules_sorted = sorted(((rule_keys[b], pct(rule_cnt[p, b], red), pct(sole_cnt[p, b], red))
+                               for b in range(len(rule_keys)) if rule_cnt[p, b]),
+                              key=lambda x: -x[1])
+        headline["pads"][name] = {
+            "violating_pct": pct(red, n), "watch_pct": pct(watch, n),
+            "hours_per_year": round(float(red) / n * 8766),
+            "samples": int(n),
+            "rules": [{"key": k_, "share": a_, "sole": b_} for k_, a_, b_ in rules_sorted],
+            "worst": ({"month": MON[worst[0]], "hour": int(worst[1]),
+                       "pct": round(100 * float(P_mh[worst]), 1)} if worst is not None else None),
+            "best_summer_daytime": best,
+            "summer_pct": pct(mh_red[p][su].sum(), mh_n[p][su].sum()),
+            "winter_pct": pct(mh_red[p][wi].sum(), mh_n[p][wi].sum()),
+            "days_with_violation_pct": pct(len(red_days[p]), len(all_days)),
+            "mill_minutes_pct": (round(100.0 * fm_ex[name] / fm_va[name], 2)
+                                 if FM is not None and fm_va.get(name) else None),
+        }
+
+    if FM is not None:
+        headline["field_mills"] = {"samples": fm_samples, "time_basis": FM["basis"]}
     meta = {
+        "headline": headline,
         "generated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ"),
         "period": [first.strftime("%Y-%m-%d"), last.strftime("%Y-%m-%d")],
         "years": sorted(years), "classifier": sorted(classifiers),
@@ -176,6 +304,13 @@ def main():
                   "Detached-anvil drift is steered by GOES band-14 anvil-level winds where available "
                   "(band 8, then 32 kt in every direction, as fallbacks).",
                   "GOES-16 is used before 7 Apr 2025 and GOES-19 from then on.",
+                 ] + ([
+                  "Field mills (LLCC 4.1.2): violating if any one-minute |E| >= 1000 V/m from a mill "
+                  "within 5 nmi of the pad in the 15 minutes before; watch within 7 nmi. Field-mill "
+                  "exceptions in other rules are not modelled - they only relieve a violation, so "
+                  "this is the conservative side.",
+                  "With field mills included, only hours with mill data count, for every rule, so the "
+                  "period is the field-mill record's."] if FM is not None else []) + [
                   "One fixed classifier version across all years; MRMS itself was updated "
                   "several times over the period."],
     }
