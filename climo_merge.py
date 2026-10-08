@@ -82,6 +82,9 @@ def main():
         ym = os.path.basename(f)[:6]
         coverage[ym] = {"scored": int(len(z["t"])), "planned": int(z["hours_planned"]),
                         "skipped": int(len(z["skipped"]))}
+        if "sat" in z.files:
+            coverage[ym]["sat"] = int(z["sat"].sum()); coverage[ym]["wind"] = int(z["wind"].sum())
+            coverage[ym]["satup"] = int((z["satup"] > 0).sum())
         st, rb = z["status"], z["red"]
         for k, ts in enumerate(z["t"]):
             tu = datetime.datetime.fromisoformat(str(ts)).replace(tzinfo=datetime.timezone.utc)
@@ -165,6 +168,14 @@ def main():
                   "rate; historical BUFKIT soundings are not available.",
                   "Anvil exception part (a) uses the 0 C slice, not measured echo bases.",
                   "Detached-anvil origin uses the previous hour, not the previous 5-minute frames.",
+                  "Satellite cloud tops (GOES band 13) can raise a cumulus class over radar echo - "
+                  "never add cloud, never lower a class. Their HEIGHT is derived from the band-13 "
+                  "temperature on the MRMS freezing level and a 6.5 C/km lapse rate for all years, "
+                  "because the 2 km height product only begins in March 2023; one method keeps the "
+                  "record consistent.",
+                  "Detached-anvil drift is steered by GOES band-14 anvil-level winds where available "
+                  "(band 8, then 32 kt in every direction, as fallbacks).",
+                  "GOES-16 is used before 7 Apr 2025 and GOES-19 from then on.",
                   "One fixed classifier version across all years; MRMS itself was updated "
                   "several times over the period."],
     }
