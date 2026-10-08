@@ -74,6 +74,30 @@
   .pick{color:var(--steel); font-size:14px; margin-bottom:8px}
   dl{display:grid; grid-template-columns:auto 1fr; gap:4px 14px; margin:0; font-size:14.5px}
   dt{color:var(--dim)} dd{margin:0}
+  .glance{margin:16px 0 4px; background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px}
+  .glance-head{display:flex; justify-content:space-between; align-items:baseline; gap:12px}
+  .glance h2{margin:0; font-family:"Barlow Condensed",sans-serif; font-weight:600; font-size:22px}
+  .glance h2 small{font-family:"Barlow",sans-serif; font-weight:400; font-size:14px; color:var(--steel); margin-left:8px}
+  .copy{background:none; color:var(--ink); border:1px solid var(--line-2); border-radius:6px; padding:5px 12px; cursor:pointer}
+  .copy:hover{background:var(--panel-2)}
+  .tiles{display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin-top:12px}
+  @media (max-width:900px){ .tiles{grid-template-columns:repeat(2,minmax(0,1fr))} }
+  .tile{background:var(--panel-2); border-radius:6px; padding:12px 14px}
+  .tile b{display:block; font-family:"Barlow Condensed",sans-serif; font-weight:700; font-size:34px; line-height:1.05}
+  .tile span{color:var(--steel); font-size:13.5px; line-height:1.35; display:block; margin-top:4px}
+  .why{margin-top:14px}
+  .millnote{margin:12px 0 0; font-size:14.5px; color:var(--ink)}
+  .millnote b{font-family:"Barlow Condensed",sans-serif; font-size:20px; font-weight:700}
+  .why-h{font-size:14px; color:var(--ink); font-weight:600}
+  .why-h small{color:var(--dim); font-weight:400; margin-left:6px}
+  .why ul{list-style:none; margin:8px 0 0; padding:0; display:grid; gap:6px}
+  .why li{display:grid; grid-template-columns:minmax(0,280px) 1fr auto; gap:10px; align-items:center; font-size:14px}
+  .why .b{height:8px; background:var(--panel-2); border-radius:2px; overflow:hidden; position:relative}
+  .why .b i{position:absolute; inset:0 auto 0 0; background:#3FA7A0}
+  .why .b em{position:absolute; inset:0 auto 0 0; background:#E8743B}
+  .why li span:last-child{color:var(--steel); font-size:13px; white-space:nowrap}
+  .sentence{margin:14px 0 0; color:var(--ink); font-size:15px; line-height:1.55; max-width:95ch;
+            border-left:3px solid var(--line-2); padding-left:12px}
   footer{margin-top:22px; padding-top:12px; border-top:1px solid var(--line); color:var(--dim); font-size:13.5px; max-width:90ch}
   footer p{margin:0 0 8px} footer b{color:var(--steel); font-weight:600}
 </style>
@@ -88,6 +112,25 @@
   </div>
   <div class="period"><b id="period">—</b><span id="samples"></span></div>
 </header>
+
+<section class="glance" id="glance" hidden>
+  <div class="glance-head">
+    <h2>At a glance <small id="g-pad"></small></h2>
+    <button class="copy" id="g-copy" title="Copy the summary sentence">Copy summary</button>
+  </div>
+  <div class="tiles">
+    <div class="tile"><b id="g-viol">—</b><span id="g-viol-s"></span></div>
+    <div class="tile"><b id="g-season">—</b><span>summer (Jun–Sep) against winter (Nov–Mar)</span></div>
+    <div class="tile"><b id="g-worst">—</b><span id="g-worst-s"></span></div>
+    <div class="tile"><b id="g-any">—</b><span id="g-any-s"></span></div>
+  </div>
+  <p class="millnote" id="g-mill" hidden></p>
+  <div class="why">
+    <div class="why-h">When violating, the rules responsible <small>share of violating hours · in how many it was the only reason</small></div>
+    <ul id="g-rules"></ul>
+  </div>
+  <p class="sentence" id="g-sentence"></p>
+</section>
 
 <div class="bar">
   <label class="lbl" for="pad">Pad</label>
@@ -137,14 +180,15 @@
 </div>
 
 <script>
-const VIEWER_VERSION = "climo-v2";
+const VIEWER_VERSION = "climo-v4";
 const DAYS = 365, HOURS = 24;
 const CUM = [0,31,59,90,120,151,181,212,243,273,304,334];
 const MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 const SHORT = {lightning:"Lightning within 10 nmi", cumulus_through:"Flight through cumulus",
   cumulus_5nm:"Cumulus colder than −10 °C within 5 nmi", cumulus_10nm:"Cumulus colder than −20 °C within 10 nmi",
   attached_anvil:"Attached anvil within 3 nmi", detached_anvil:"Detached anvil within 3 nmi",
-  disturbed:"Disturbed weather", thick_layer:"Thick cloud layer"};
+  disturbed:"Disturbed weather", thick_layer:"Thick cloud layer",
+  field_mill:"Field mill ≥ 1,000 V/m within 5 nmi"};
 // Sequential ramp, deliberately NOT red/yellow/green: this is a frequency, not a status.
 const STOPS = [[0,"#1E2B3B"],[0.15,"#2E5E8A"],[0.35,"#3FA7A0"],[0.55,"#E3C55A"],[0.75,"#E8743B"],[1,"#D9364A"]];
 
@@ -214,7 +258,53 @@ function boot(){
   drawAll();
 }
 
-function drawAll(){ drawNow(); drawStrip(); drawHeat(); drawMap(); drawCov(); }
+function drawAll(){ drawGlance(); drawNow(); drawStrip(); drawHeat(); drawMap(); drawCov(); }
+
+// The headline - one pad's whole record in four numbers, its reasons, and a sentence for a slide.
+function drawGlance(){
+  const H = M.headline, g = H && H.pads && H.pads[M.pads[pad]];
+  $("glance").hidden = !g;
+  if (!g) return;
+  const name = M.pads[pad], hh = x => String(x).padStart(2, "0") + ":00";
+  $("g-pad").textContent = `${name} · ${M.period[0]} to ${M.period[1]}`;
+  $("g-viol").textContent = `${g.violating_pct}% of the time`;
+  $("g-viol-s").textContent = `${name} in violation — about ${g.hours_per_year.toLocaleString()} hours a year; ` +
+    `watch or worse ${g.watch_pct}%`;
+  $("g-season").textContent = `${g.summer_pct ?? "—"}% vs ${g.winter_pct ?? "—"}%`;
+  $("g-worst").textContent = g.worst ? `${g.worst.pct}%` : "—";
+  $("g-worst-s").textContent = g.worst
+    ? `worst: ${g.worst.month} around ${hh(g.worst.hour)} local` +
+      (g.best_summer_daytime ? `; best summer daytime hour ${hh(g.best_summer_daytime.hour)} at ${g.best_summer_daytime.pct}%` : "")
+    : "not enough samples per month and hour yet";
+  $("g-any").textContent = H.any_pad_violating_pct != null ? `${H.any_pad_violating_pct}%` : "—";
+  $("g-any-s").textContent = `of hours with at least one pad violating; ` +
+    `${name} had a violation on ${g.days_with_violation_pct}% of days`;
+  $("g-rules").innerHTML = g.rules.map(r => `<li><span>${SHORT[r.key] || r.key}</span>
+      <span class="b"><i style="width:${r.share}%"></i><em style="width:${r.sole}%"></em></span>
+      <span>${r.share}% · only reason ${r.sole}%</span></li>`).join("") ||
+    `<li><span style="color:var(--dim)">No violating hours in the record</span></li>`;
+  const top = g.rules[0];
+  const mill = g.mill_minutes_pct;
+  $("g-mill").hidden = mill == null;
+  if (mill != null) $("g-mill").innerHTML = `Field mills within 5 nmi of ${name} read <b>≥ 1,000 V/m ` +
+    `${mill}%</b> of the time, minute by minute — before the 15-minute look-back the rule adds.`;
+  const FULL = {Jan:"January",Feb:"February",Mar:"March",Apr:"April",May:"May",Jun:"June",Jul:"July",
+                Aug:"August",Sep:"September",Oct:"October",Nov:"November",Dec:"December"};
+  // only the first letter: lowercasing the whole name turned "°C" into "°c"
+  const lc1 = t => t.charAt(0).toLowerCase() + t.slice(1);
+  const s = `Across ${M.period[0]} to ${M.period[1]}, ${name} would have been in violation of the ` +
+    `lightning launch commit criteria ${g.violating_pct}% of the time — about ${g.hours_per_year.toLocaleString()} ` +
+    `hours a year` + (g.summer_pct != null && g.winter_pct != null
+      ? `, rising to ${g.summer_pct}% in summer and falling to ${g.winter_pct}% in winter` : "") + `. ` +
+    (g.worst ? `The worst time is ${FULL[g.worst.month] || g.worst.month} around ${hh(g.worst.hour)} local (${g.worst.pct}%)` +
+      (g.best_summer_daytime ? `; in summer the best daytime hour is ${hh(g.best_summer_daytime.hour)} (${g.best_summer_daytime.pct}%)` : "") + ". " : "") +
+    (top ? `When violating, the most common reason is ${lc1(SHORT[top.key] || top.key)} ` +
+      `(${top.share}% of violating hours, and the only reason in ${top.sole}%).` : "") +
+    (mill != null ? ` Field mills within 5 nmi read 1,000 V/m or more ${mill}% of the time.` : "");
+  $("g-sentence").textContent = s;
+  $("g-copy").onclick = () => { navigator.clipboard && navigator.clipboard.writeText(s);
+    $("g-copy").textContent = "Copied"; setTimeout(() => $("g-copy").textContent = "Copy summary", 1500); };
+}
 
 function drawNow(){
   const v = plane(pad, measure), n = plane(pad, 2);
