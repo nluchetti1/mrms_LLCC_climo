@@ -98,6 +98,24 @@
   .why li span:last-child{color:var(--steel); font-size:13px; white-space:nowrap}
   .sentence{margin:14px 0 0; color:var(--ink); font-size:15px; line-height:1.55; max-width:95ch;
             border-left:3px solid var(--line-2); padding-left:12px}
+  .whatif{margin:10px 0 4px; background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px 16px}
+  .whatif summary{cursor:pointer; font-size:16px; display:flex; gap:12px; align-items:baseline; flex-wrap:wrap}
+  .whatif summary b{font-family:"Barlow Condensed",sans-serif; font-size:20px; font-weight:600}
+  #wi-state{color:var(--steel); font-size:13.5px}
+  .wi-lead{color:var(--steel); font-size:14px; max-width:95ch; margin:10px 0 12px}
+  .wi-grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(270px,1fr)); gap:10px 22px}
+  .wi-group{grid-column:1/-1; font-family:"Barlow Condensed",sans-serif; font-size:16px; color:var(--steel);
+            border-top:1px solid var(--line); padding-top:8px; margin-top:4px}
+  .wi-row{display:grid; grid-template-columns:1fr auto; gap:2px 10px; align-items:center; font-size:14px}
+  .wi-row input[type=range]{grid-column:1/-1; width:100%; accent-color:#3FA7A0}
+  .wi-row output{font-variant-numeric:tabular-nums; color:var(--ink)}
+  .wi-row.changed output{color:#E3C55A; font-weight:600}
+  .wi-row .std{color:var(--dim); font-size:12px}
+  .wi-chk{display:flex; gap:8px; align-items:center; font-size:14px}
+  .wi-foot{display:flex; gap:14px; align-items:center; margin-top:12px}
+  .wi-check{color:var(--dim); font-size:13px}
+  .delta{display:block; font-family:"Barlow",sans-serif; font-size:13px; font-weight:500; color:var(--steel); margin-top:2px}
+  .delta.up{color:#E8743B} .delta.down{color:#3FA7A0}
   footer{margin-top:22px; padding-top:12px; border-top:1px solid var(--line); color:var(--dim); font-size:13.5px; max-width:90ch}
   footer p{margin:0 0 8px} footer b{color:var(--steel); font-weight:600}
 </style>
@@ -131,6 +149,20 @@
   </div>
   <p class="sentence" id="g-sentence"></p>
 </section>
+
+<details class="whatif" id="whatif" hidden>
+  <summary><b>What if the rules were different?</b>
+    <span id="wi-state">Standard rules</span></summary>
+  <p class="wi-lead">Change a standoff or threshold and the whole record is re-scored here in the
+    browser — headline, day strip and heat map — with the standard figure beside each headline
+    number. The regional map stays on the standard rules. Isotherm levels, the 0 dBZ cloud edge and
+    how each cloud is classed are fixed; changing those needs a full re-run.</p>
+  <div class="wi-grid" id="wi-grid"></div>
+  <div class="wi-foot">
+    <button class="copy" id="wi-reset">Reset to the standard</button>
+    <span id="wi-check" class="wi-check"></span>
+  </div>
+</details>
 
 <div class="bar">
   <label class="lbl" for="pad">Pad</label>
@@ -180,7 +212,7 @@
 </div>
 
 <script>
-const VIEWER_VERSION = "climo-v4";
+const VIEWER_VERSION = "climo-v5";
 const DAYS = 365, HOURS = 24;
 const CUM = [0,31,59,90,120,151,181,212,243,273,304,334];
 const MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
@@ -193,6 +225,7 @@ const SHORT = {lightning:"Lightning within 10 nmi", cumulus_through:"Flight thro
 const STOPS = [[0,"#1E2B3B"],[0.15,"#2E5E8A"],[0.35,"#3FA7A0"],[0.55,"#E3C55A"],[0.75,"#E8743B"],[1,"#D9364A"]];
 
 let M = null, PADS = null, MAPS = null, pad = 0, measure = 0, sel = null;
+let FX = null, SCEN = null, PARAMS = null;
 const $ = id => document.getElementById(id);
 const hex = h => [parseInt(h.slice(1,3),16), parseInt(h.slice(3,5),16), parseInt(h.slice(5,7),16)];
 function color(p){              // p in 0..100, 255 = no data
@@ -218,8 +251,8 @@ function capeNow(){
   return {m: +p.month, d: +p.day, h: +p.hour % 24, tz: p.timeZoneName};
 }
 
-function plane(pi, k){ const per = M.planes_per_pad, sz = DAYS * HOURS;
-  return PADS.subarray((pi * per + k) * sz, (pi * per + k + 1) * sz); }
+function plane(pi, k){ const per = M.planes_per_pad, sz = DAYS * HOURS, src = SCEN ? SCEN.planes : PADS;
+  return src.subarray((pi * per + k) * sz, (pi * per + k + 1) * sz); }
 const at = (arr, d, h) => arr[d * HOURS + h];
 
 async function load(){
@@ -254,29 +287,238 @@ function boot(){
     `hour, within ±${M.window_days} days of the date.</p>` +
     `<p><b>Caveats.</b> ${M.notes.join(" ")}</p><p>Page ${VIEWER_VERSION}. Built ${M.generated}.</p>`;
   const c = capeNow(); sel = {d: doyOf(c.m, c.d), h: c.h, now: true, tz: c.tz};
+  buildWhatIf();
   $("basemap").src = "basemap.png";
   drawAll();
+}
+
+// ================================ what if ================================
+// Re-scores every pad-sample from its recorded features - distances to each rule's cloud and the
+// MRR - exactly as the merge's Python scorer does, which at the standard settings reproduced the
+// classifier's verdicts on every pad-sample. Then rebuilds the planes and headline the page draws.
+const WI = [
+  ["Standoffs (nmi)"],
+  ["ltg_nm", "Lightning", 0, 20, 0.5], ["cu10_nm", "Cumulus colder than −10 °C", 0, 15, 0.5],
+  ["cu20_nm", "Cumulus colder than −20 °C", 0, 20, 0.5], ["att_nm", "Attached anvil", 0, 10, 0.5],
+  ["det_nm", "Detached anvil", 0, 10, 0.5], ["margin_nm", "Watch margin", 0, 5, 0.5],
+  ["ltg_watch_nm", "Lightning watch distance", 0, 25, 0.5],
+  ["Exceptions"],
+  ["anvil_exc", "Anvil exception (LLCCR 12, 22)"], ["mrr_dbz", "Anvil exception: MRR below (dBZ)", 0, 20, 0.5],
+  ["excep_nm", "Anvil exception: no echo below 0 °C within (nmi)", 0, 10, 0.5],
+  ["thick_exc", "Thick-layer exception"], ["thick_mrr_dbz", "Thick-layer exception: MRR below (dBZ)", 0, 20, 0.5],
+  ["Field mills", "mills"],
+  ["fm_vm", "Field mill threshold (V/m)", 500, 3000, 50, "mills"], ["fm_nm", "Field mill radius (nmi)", 1, 10, 0.5, "mills"],
+  ["Rules in force"],
+];
+const FDIST = ["cuthru", "cu10", "cu20", "att", "det", "warm", "thick", "ltg"];
+
+async function loadFeatures(){
+  if (FX || !M.features) return FX;
+  const r = await fetch("climo_features.bin"); if (!r.ok) return null;
+  let b = new Uint8Array(await r.arrayBuffer());
+  if (b[0] === 0x1f && b[1] === 0x8b){
+    const ds = new Blob([b]).stream().pipeThrough(new DecompressionStream("gzip"));
+    b = new Uint8Array(await new Response(ds).arrayBuffer());
+  }
+  const f = M.features, S = f.samples, P = f.pads, K = f.k, Mm = f.mills;
+  let o = 0; const take = (n, T) => { const a = new T(b.slice(o, o + n * T.BYTES_PER_ELEMENT).buffer); o += n * T.BYTES_PER_ELEMENT; return a; };
+  FX = {S, P, K, Mm, doy: take(S, Uint16Array), hour: take(S, Uint8Array), month: take(S, Uint8Array),
+        day: take(S, Uint16Array), use: take(S * P, Uint8Array), feat: take(S * P * K, Uint8Array),
+        mill: take(S * Mm, Uint8Array)};
+  // nmi from each pad to each mill - the same formula the merge uses
+  FX.millD = M.pads.map(name => {
+    const [pla, plo] = M.sites[name] || [0, 0];
+    return (f.mill_lat || []).map((la, i) => { const k = Math.cos((pla + la) / 2 * Math.PI / 180);
+      return Math.hypot((la - pla) * 111.32, (f.mill_lon[i] - plo) * 111.32 * k) / 1.852; });
+  });
+  return FX;
+}
+
+function scorePad(p, P_, on){
+  const E = 1e-6, S = FX.S, K = FX.K, R = M.rule_keys, out = new Int8Array(S), bits = new Uint16Array(S);
+  const md = FX.millD[p], thr = Math.floor(P_.fm_vm / 50), ri = Object.fromEntries(R.map((k, i) => [k, i]));
+  for (let s = 0; s < S; s++){
+    if (!FX.use[s * FX.P + p]){ out[s] = -1; continue; }
+    const base = (s * FX.P + p) * K, f = FX.feat, d = {};
+    for (let q = 0; q < 8; q++){ const v = f[base + q]; d[FDIST[q]] = v === 255 ? Infinity : v / 10; }
+    const mrr = f[base + 8] / 2;
+    const lit = r => d.ltg <= r + E;
+    const exc = P_.anvil_exc && !(d.warm <= P_.excep_nm + E) && mrr < P_.mrr_dbz;
+    const texc = P_.thick_exc && mrr < P_.thick_mrr_dbz;
+    const rules = m => {
+      const r = {
+        lightning: lit(P_.ltg_nm + m), cumulus_through: d.cuthru <= m + E,
+        cumulus_5nm: d.cu10 <= P_.cu10_nm + m + E, cumulus_10nm: d.cu20 <= P_.cu20_nm + m + E,
+        attached_anvil: ((d.att <= P_.att_nm + m + E) && !exc) || ((d.att <= P_.att_ltg_nm + m + E) && lit(P_.ltg_nm + m)),
+        detached_anvil: (d.det <= P_.det_nm + m + E) && !exc, disturbed: false,
+        thick_layer: (d.thick <= m + E) && !texc};
+      if ("field_mill" in ri){
+        let fm = false;
+        for (let i = 0; i < FX.Mm; i++){ const v = FX.mill[s * FX.Mm + i];
+          if (v !== 255 && v >= thr && md[i] <= P_.fm_nm + m + E){ fm = true; break; } }
+        r.field_mill = fm;
+      }
+      return r;
+    };
+    const red = rules(0); let b = 0;
+    for (const k of R) if (red[k] && on[k] !== false) b |= 1 << ri[k];
+    if (b){ out[s] = 2; bits[s] = b; continue; }
+    const yel = rules(P_.margin_nm);
+    out[s] = (R.some(k => yel[k] && on[k] !== false) || (on.lightning !== false && lit(P_.ltg_watch_nm))) ? 1 : 0;
+  }
+  return {st: out, bits};
+}
+
+function aggregate(P_, on){
+  const R = M.rule_keys, nR = R.length, per = 3 + nR, SZ = DAYS * HOURS, S = FX.S;
+  const planes = new Uint8Array(M.pads.length * per * SZ), H = {pads: {}};
+  const r1 = x => Math.round(x * 10) / 10;
+  const allDays = new Set(); for (let s = 0; s < S; s++) allDays.add(FX.day[s]);
+  const anyRed = new Uint8Array(S), anyUse = new Uint8Array(S);
+  M.pads.forEach((name, p) => {
+    const {st, bits} = scorePad(p, P_, on);
+    const n = new Float64Array(SZ), red = new Float64Array(SZ), wat = new Float64Array(SZ);
+    const rr = Array.from({length: nR}, () => new Float64Array(SZ));
+    const mhN = new Float64Array(288), mhR = new Float64Array(288), mhW = new Float64Array(288);
+    const rc = new Float64Array(nR), sc = new Float64Array(nR), days = new Set();
+    for (let s = 0; s < S; s++){
+      if (st[s] < 0) continue;
+      anyUse[s] = 1;
+      const c = FX.doy[s] * HOURS + FX.hour[s], mh = (FX.month[s] - 1) * 24 + FX.hour[s];
+      n[c]++; mhN[mh]++;
+      if (st[s] >= 1){ wat[c]++; mhW[mh]++; }
+      if (st[s] === 2){
+        red[c]++; mhR[mh]++; anyRed[s] = 1; days.add(FX.day[s]);
+        let cnt = 0, last = -1;
+        for (let b = 0; b < nR; b++) if (bits[s] & (1 << b)){ rr[b][c]++; rc[b]++; cnt++; last = b; }
+        if (cnt === 1) sc[last]++;
+      }
+    }
+    // +/-7 day circular smoothing, then percentages - as the merge does
+    const sm = a => { const o = new Float64Array(SZ), w = M.window_days;
+      for (let d = 0; d < DAYS; d++) for (let h = 0; h < HOURS; h++){ let t = 0;
+        for (let k = -w; k <= w; k++) t += a[(((d + k) % DAYS + DAYS) % DAYS) * HOURS + h];
+        o[d * HOURS + h] = t; } return o; };
+    const N = sm(n), Rd = sm(red), W = sm(wat), base = p * per * SZ;
+    for (let i = 0; i < SZ; i++){
+      planes[base + i] = N[i] > 0 ? Math.round(100 * Rd[i] / N[i]) : 255;
+      planes[base + SZ + i] = N[i] > 0 ? Math.round(100 * W[i] / N[i]) : 255;
+      planes[base + 2 * SZ + i] = Math.min(254, N[i]);
+    }
+    for (let b = 0; b < nR; b++){ const X = sm(rr[b]);
+      for (let i = 0; i < SZ; i++) planes[base + (3 + b) * SZ + i] = Rd[i] > 0 ? Math.round(100 * X[i] / Rd[i]) : 0; }
+    // headline
+    const tn = n.reduce((a, x) => a + x, 0), tr = red.reduce((a, x) => a + x, 0), tw = wat.reduce((a, x) => a + x, 0);
+    if (!tn) return;
+    let worst = null;
+    for (let mo = 0; mo < 12; mo++) for (let hh = 0; hh < 24; hh++){ const i = mo * 24 + hh;
+      if (mhN[i] >= 20){ const v = mhR[i] / mhN[i]; if (!worst || v > worst.v) worst = {v, mo, hh}; } }
+    const su = [5, 6, 7, 8], wi = [10, 11, 0, 1, 2];
+    const sum = (A, ms, hrs) => ms.reduce((a, mo) => a + (hrs || [...Array(24).keys()]).reduce((b, hh) => b + A[mo * 24 + hh], 0), 0);
+    let best = null;
+    for (let hh = 7; hh <= 19; hh++){ const nn = sum(mhN, su, [hh]), rv = sum(mhR, su, [hh]);
+      if (nn >= 20){ const v = rv / nn; if (!best || v < best.v) best = {v, hh}; } }
+    const MONS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    const base0 = M.headline.pads[name] || {};
+    H.pads[name] = {
+      violating_pct: r1(100 * tr / tn), watch_pct: r1(100 * tw / tn), hours_per_year: Math.round(tr / tn * 8766),
+      samples: tn,
+      rules: R.map((k, b) => ({key: k, share: r1(100 * rc[b] / Math.max(tr, 1)), sole: r1(100 * sc[b] / Math.max(tr, 1))}))
+              .filter((x, b) => rc[b] > 0).sort((a, b) => b.share - a.share),
+      worst: worst ? {month: MONS[worst.mo], hour: worst.hh, pct: r1(100 * worst.v)} : null,
+      best_summer_daytime: best ? {hour: best.hh, pct: r1(100 * best.v)} : null,
+      summer_pct: r1(100 * sum(mhR, su) / Math.max(sum(mhN, su), 1)),
+      winter_pct: r1(100 * sum(mhR, wi) / Math.max(sum(mhN, wi), 1)),
+      days_with_violation_pct: r1(100 * days.size / Math.max(allDays.size, 1)),
+      mill_minutes_pct: base0.mill_minutes_pct ?? null,
+    };
+  });
+  let ar = 0, au = 0; for (let s = 0; s < S; s++){ if (anyUse[s]){ au++; ar += anyRed[s]; } }
+  H.any_pad_violating_pct = r1(100 * ar / Math.max(au, 1));
+  return {planes, headline: H};
+}
+
+function isStandard(P_, on){
+  const std = M.features.standard;
+  return Object.keys(std).every(k => P_[k] === std[k]) && M.rule_keys.every(k => on[k] !== false);
+}
+let wiTimer = null;
+function wiChanged(){
+  clearTimeout(wiTimer);
+  wiTimer = setTimeout(async () => {
+    await loadFeatures(); if (!FX) return;
+    const on = PARAMS.on;
+    if (isStandard(PARAMS, on)){ SCEN = null; }
+    else SCEN = aggregate(PARAMS, on);
+    const std = M.features.standard, diffs = [];
+    WI.forEach(r => { if (r.length > 2 && PARAMS[r[0]] !== std[r[0]])
+      diffs.push(`${r[1]} ${typeof std[r[0]] === "boolean" ? (PARAMS[r[0]] ? "on" : "off") : PARAMS[r[0]]}`); });
+    M.rule_keys.forEach(k => { if (on[k] === false) diffs.push(`${SHORT[k] || k} off`); });
+    $("wi-state").textContent = diffs.length ? "Scenario: " + diffs.join(" · ") : "Standard rules";
+    document.querySelectorAll(".wi-row").forEach(el => {
+      const k = el.dataset.k; el.classList.toggle("changed", PARAMS[k] !== std[k]); });
+    drawAll();
+  }, 120);
+}
+
+function buildWhatIf(){
+  if (!M.features) return;
+  $("whatif").hidden = false;
+  const std = M.features.standard, hasMills = (M.features.mills || 0) > 0;
+  PARAMS = {...std, on: {}};
+  const g = $("wi-grid"); let html = "";
+  for (const r of WI){
+    if (r.length <= 2){ if (r[1] === "mills" && !hasMills) continue;
+      html += `<div class="wi-group">${r[0]}</div>`;
+      if (r[0] === "Rules in force") html += M.rule_keys.filter(k => k !== "disturbed").map(k =>
+        `<label class="wi-chk"><input type="checkbox" data-rule="${k}" checked> ${SHORT[k] || k}</label>`).join("");
+      continue; }
+    if (r[5] === "mills" && !hasMills) continue;
+    const [k, label, lo, hi, step] = r;
+    if (typeof std[k] === "boolean")
+      html += `<label class="wi-chk"><input type="checkbox" data-k="${k}" ${std[k] ? "checked" : ""}> ${label}</label>`;
+    else html += `<div class="wi-row" data-k="${k}"><span>${label}</span><output>${std[k]}</output>
+      <input type="range" min="${lo}" max="${hi}" step="${step}" value="${std[k]}" data-k="${k}">
+      <span class="std">standard ${std[k]}</span></div>`;
+  }
+  g.innerHTML = html;
+  g.querySelectorAll("input[type=range]").forEach(el => el.addEventListener("input", () => {
+    PARAMS[el.dataset.k] = +el.value; el.parentElement.querySelector("output").textContent = el.value; wiChanged(); }));
+  g.querySelectorAll("input[type=checkbox][data-k]").forEach(el => el.addEventListener("change", () => {
+    PARAMS[el.dataset.k] = el.checked; wiChanged(); }));
+  g.querySelectorAll("input[type=checkbox][data-rule]").forEach(el => el.addEventListener("change", () => {
+    PARAMS.on[el.dataset.rule] = el.checked; wiChanged(); }));
+  $("wi-reset").onclick = () => { buildWhatIf(); SCEN = null; $("wi-state").textContent = "Standard rules"; drawAll(); };
+  $("wi-check").textContent = `Re-scoring from features reproduced the classifier on ${M.features.agreement_pct}% of pad-samples.`;
+  $("whatif").addEventListener("toggle", () => { if ($("whatif").open) loadFeatures(); }, {once: true});
 }
 
 function drawAll(){ drawGlance(); drawNow(); drawStrip(); drawHeat(); drawMap(); drawCov(); }
 
 // The headline - one pad's whole record in four numbers, its reasons, and a sentence for a slide.
 function drawGlance(){
-  const H = M.headline, g = H && H.pads && H.pads[M.pads[pad]];
+  const H = SCEN ? SCEN.headline : M.headline, g = H && H.pads && H.pads[M.pads[pad]];
+  const B = M.headline.pads[M.pads[pad]];
+  const delta = (v, b, unit) => {
+    if (!SCEN || v == null || b == null) return "";
+    const d = Math.round((v - b) * 10) / 10;
+    return `<span class="delta ${d > 0 ? "up" : d < 0 ? "down" : ""}">standard ${b}${unit}` +
+           (d ? `, ${d > 0 ? "+" : ""}${d}` : ", no change") + `</span>`; };
   $("glance").hidden = !g;
   if (!g) return;
   const name = M.pads[pad], hh = x => String(x).padStart(2, "0") + ":00";
   $("g-pad").textContent = `${name} · ${M.period[0]} to ${M.period[1]}`;
-  $("g-viol").textContent = `${g.violating_pct}% of the time`;
+  $("g-viol").innerHTML = `${g.violating_pct}% of the time` + delta(g.violating_pct, B && B.violating_pct, "%");
   $("g-viol-s").textContent = `${name} in violation — about ${g.hours_per_year.toLocaleString()} hours a year; ` +
     `watch or worse ${g.watch_pct}%`;
-  $("g-season").textContent = `${g.summer_pct ?? "—"}% vs ${g.winter_pct ?? "—"}%`;
-  $("g-worst").textContent = g.worst ? `${g.worst.pct}%` : "—";
+  $("g-season").innerHTML = `${g.summer_pct ?? "—"}% vs ${g.winter_pct ?? "—"}%` + delta(g.summer_pct, B && B.summer_pct, "% summer");
+  $("g-worst").innerHTML = (g.worst ? `${g.worst.pct}%` : "—") + delta(g.worst && g.worst.pct, B && B.worst && B.worst.pct, "%");
   $("g-worst-s").textContent = g.worst
     ? `worst: ${g.worst.month} around ${hh(g.worst.hour)} local` +
       (g.best_summer_daytime ? `; best summer daytime hour ${hh(g.best_summer_daytime.hour)} at ${g.best_summer_daytime.pct}%` : "")
     : "not enough samples per month and hour yet";
-  $("g-any").textContent = H.any_pad_violating_pct != null ? `${H.any_pad_violating_pct}%` : "—";
+  $("g-any").innerHTML = (H.any_pad_violating_pct != null ? `${H.any_pad_violating_pct}%` : "—") +
+    delta(H.any_pad_violating_pct, M.headline.any_pad_violating_pct, "%");
   $("g-any-s").textContent = `of hours with at least one pad violating; ` +
     `${name} had a violation on ${g.days_with_violation_pct}% of days`;
   $("g-rules").innerHTML = g.rules.map(r => `<li><span>${SHORT[r.key] || r.key}</span>
@@ -292,7 +534,8 @@ function drawGlance(){
                 Aug:"August",Sep:"September",Oct:"October",Nov:"November",Dec:"December"};
   // only the first letter: lowercasing the whole name turned "°C" into "°c"
   const lc1 = t => t.charAt(0).toLowerCase() + t.slice(1);
-  const s = `Across ${M.period[0]} to ${M.period[1]}, ${name} would have been in violation of the ` +
+  const s = (SCEN ? `Under the modified rules (${$("wi-state").textContent.replace("Scenario: ", "")}): ` : "") +
+    `Across ${M.period[0]} to ${M.period[1]}, ${name} would have been in violation of the ` +
     `lightning launch commit criteria ${g.violating_pct}% of the time — about ${g.hours_per_year.toLocaleString()} ` +
     `hours a year` + (g.summer_pct != null && g.winter_pct != null
       ? `, rising to ${g.summer_pct}% in summer and falling to ${g.winter_pct}% in winter` : "") + `. ` +
