@@ -37,6 +37,51 @@ LOCAL = ZoneInfo("America/New_York")
 WINDOW_D = 7
 
 
+# The standard settings. The page's "what if" panel starts from these and re-scores from features.
+STANDARD = {"ltg_nm": 10.0, "ltg_watch_nm": 20.0, "cu10_nm": 5.0, "cu20_nm": 10.0,
+            "att_nm": 3.0, "det_nm": 3.0, "att_ltg_nm": 10.0, "excep_nm": 5.0, "mrr_dbz": 7.5,
+            "thick_mrr_dbz": 7.5, "margin_nm": 2.0, "fm_vm": 1000.0, "fm_nm": 5.0,
+            "anvil_exc": True, "thick_exc": True}
+FEAT_DIST = ["cuthru", "cu10", "cu20", "att", "det", "warm", "thick", "ltg"]
+
+
+def score_features(f, millv, mill_d, P_, rule_keys):
+    """(status, red bits) for one pad-sample from its features, under settings P_ - the same logic
+    as evaluate(), applied to distances. f: uint8[9]; millv: uint8 per mill (50 V/m units, 255 none)
+    or None; mill_d: nmi from this pad to each mill."""
+    E = 1e-6
+    d = {k: (np.inf if f[i] == 255 else f[i] / 10.0) for i, k in enumerate(FEAT_DIST)}
+    mrr = f[8] / 2.0
+    lit = lambda r: d["ltg"] <= r + E
+    exc = P_["anvil_exc"] and not (d["warm"] <= P_["excep_nm"] + E) and mrr < P_["mrr_dbz"]
+    texc = P_["thick_exc"] and mrr < P_["thick_mrr_dbz"]
+    def rules(m):
+        r = {"lightning": lit(P_["ltg_nm"] + m),
+             "cumulus_through": d["cuthru"] <= m + E,
+             "cumulus_5nm": d["cu10"] <= P_["cu10_nm"] + m + E,
+             "cumulus_10nm": d["cu20"] <= P_["cu20_nm"] + m + E,
+             "attached_anvil": ((d["att"] <= P_["att_nm"] + m + E) and not exc)
+                               or ((d["att"] <= P_["att_ltg_nm"] + m + E) and lit(P_["ltg_nm"] + m)),
+             "detached_anvil": (d["det"] <= P_["det_nm"] + m + E) and not exc,
+             "disturbed": False,
+             "thick_layer": (d["thick"] <= m + E) and not texc}
+        if "field_mill" in rule_keys:
+            r["field_mill"] = False
+            if millv is not None:
+                thr = int(P_["fm_vm"] // 50)
+                ok = (millv != 255) & (mill_d <= P_["fm_nm"] + m + E)
+                r["field_mill"] = bool(((millv >= thr) & ok).any())
+        return r
+    red = rules(0.0)
+    bits = sum(1 << b for b, k in enumerate(rule_keys) if red.get(k))
+    if bits:
+        return 2, bits
+    yel = rules(P_["margin_nm"])
+    if any(yel.get(k) for k in rule_keys) or lit(P_["ltg_watch_nm"]):
+        return 1, 0
+    return 0, 0
+
+
 def doy_index(d):
     """0..364 on a non-leap calendar; Feb 29 folds into Feb 28."""
     if d.month == 2 and d.day == 29:
@@ -83,6 +128,9 @@ def main():
             FM["near5"][p] = np.where(d <= 5.0)[0]; FM["near7"][p] = np.where(d <= 7.0)[0]
         print(f"field mills: {len(FM['lat'])} mills, {len(FM['hours'])} hours; time basis: {FM['basis']}")
     fm_ex = {}; fm_va = {}; fm_samples = 0
+    FX = {"doy": [], "hour": [], "month": [], "day": [], "use": [], "feat": [], "mill": [],
+          "st": [], "rb": []}
+    have_feat = True
     files = sorted(glob.glob(os.path.join(a.inp, "*.npz")))
     if not files:
         raise SystemExit("no month files found")
@@ -121,6 +169,9 @@ def main():
             coverage[ym]["sat"] = int(z["sat"].sum()); coverage[ym]["wind"] = int(z["wind"].sum())
             coverage[ym]["satup"] = int((z["satup"] > 0).sum())
         st, rb = z["status"], z["red"]
+        zf = z["feat"] if "feat" in z.files else None
+        if zf is None or len(zf) != len(z["t"]):
+            have_feat = False
         for k, ts in enumerate(z["t"]):
             tu = datetime.datetime.fromisoformat(str(ts)).replace(tzinfo=datetime.timezone.utc)
             tl = tu.astimezone(LOCAL)
@@ -157,6 +208,14 @@ def main():
                     stk[p] = 2; rbk[p] |= 1 << radar_R
                 elif mill_watch[p] and stk[p] == 0:
                     stk[p] = 1
+            if have_feat:
+                FX["doy"].append(d); FX["hour"].append(h); FX["month"].append(tl.month)
+                FX["day"].append(tl.date().toordinal()); FX["use"].append([1 if u_ else 0 for u_ in use])
+                FX["feat"].append(zf[k]); FX["st"].append(list(stk)); FX["rb"].append(list(rbk))
+                if FM is not None:
+                    mv = FM["max15"][hi].astype(np.int64); nv = FM["n15"][hi]
+                    FX["mill"].append(np.where((nv > 0) & (mv < 65535), np.minimum(mv // 50, 254), 255)
+                                      .astype(np.uint8))
             all_days.add(tl.date()); any_n += 1
             if any(stk[p] == 2 for p in range(len(pads)) if use[p]):
                 any_red += 1
@@ -279,7 +338,49 @@ def main():
 
     if FM is not None:
         headline["field_mills"] = {"samples": fm_samples, "time_basis": FM["basis"]}
+
+    # ---- "what if" features: the page re-scores from these as the settings change ------------------
+    features = None
+    if have_feat and FX["feat"]:
+        S = len(FX["feat"])
+        feat = np.stack(FX["feat"]).astype(np.uint8)                   # [S, P, 9]
+        use_ = np.array(FX["use"], np.uint8)                           # [S, P]
+        mills = np.stack(FX["mill"]) if FX["mill"] else np.zeros((S, 0), np.uint8)
+        day0 = min(FX["day"])
+        parts_ = [np.array(FX["doy"], np.uint16), np.array(FX["hour"], np.uint8),
+                  np.array(FX["month"], np.uint8), (np.array(FX["day"]) - day0).astype(np.uint16),
+                  use_, feat, mills]
+        blob = b"".join(p_.tobytes() for p_ in parts_)
+        with open(os.path.join(a.site, "climo_features.bin"), "wb") as fp:
+            fp.write(gzip.compress(blob, compresslevel=6))
+        mill_d = {}
+        if FM is not None:
+            for name in pads:
+                i_ = FM["pads"].index(name)
+                k_ = np.cos(np.radians((FM["plat"][i_] + FM["lat"]) / 2))
+                mill_d[name] = np.hypot((FM["lat"] - FM["plat"][i_]) * 111.32,
+                                        (FM["lon"] - FM["plon"][i_]) * 111.32 * k_) / 1.852
+        # the check: at standard settings, re-scoring from features must reproduce every verdict
+        agree = total = 0
+        st_ = np.array(FX["st"]); rb_ = np.array(FX["rb"])
+        for i_ in range(S):
+            for p_, name in enumerate(pads):
+                if not use_[i_, p_]:
+                    continue
+                s2, b2 = score_features(feat[i_, p_], mills[i_] if mills.shape[1] else None,
+                                        mill_d.get(name), STANDARD, rule_keys)
+                total += 1
+                agree += int(s2 == st_[i_, p_] and b2 == rb_[i_, p_])
+        rate = 100.0 * agree / max(total, 1)
+        print(f"what-if features: {S} samples; re-scored at standard settings, {agree}/{total} "
+              f"pad-samples match the classifier ({rate:.3f}%)")
+        features = {"samples": S, "pads": len(pads), "k": int(feat.shape[2]), "mills": int(mills.shape[1]),
+                    "names": FEAT_DIST + ["mrr1"], "day0": int(day0), "standard": STANDARD,
+                    "agreement_pct": round(rate, 3),
+                    "mill_lat": (FM["lat"].tolist() if FM is not None else []),
+                    "mill_lon": (FM["lon"].tolist() if FM is not None else [])}
     meta = {
+        "features": features,
         "headline": headline,
         "generated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ"),
         "period": [first.strftime("%Y-%m-%d"), last.strftime("%Y-%m-%d")],
