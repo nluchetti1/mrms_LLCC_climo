@@ -81,6 +81,14 @@ GOES_SWITCH = datetime.datetime(2025, 4, 7)
 GOES_BUCKETS = ("https://noaa-goes16.s3.amazonaws.com", "https://noaa-goes19.s3.amazonaws.com")
 SAT_TOL_MIN, WIND_TOL_MIN = 12, 30
 _goes_listings = {}
+
+# Per pad and sample, what the "what if" page needs to re-apply any standoff or threshold without
+# re-scoring the radar: the distance (nmi) to the nearest cell of each rule's cloud mask, and the
+# MRR the exceptions test. Distances are rounded UP to 0.1 nmi, capped at 25.4 (255 = farther or
+# none) - rounding up keeps "within r" exact for any r that is a multiple of 0.1 nmi, because the
+# standoff footprint and this distance use the same grid metric. MRR is dBZ x 2 (negative -> 0).
+FEAT_DIST = ["cuthru", "cu10", "cu20", "att", "det", "warm", "thick", "ltg"]
+FEAT_NAMES = FEAT_DIST + ["mrr1"]
 FREEZING_DIR = "Model_0degC_Height_00.50"
 FREEZING_EVERY_H = 6
 MATCH_MIN = 3.0                                 # a file must lie within this of the sample time
@@ -270,7 +278,7 @@ def score_hours(hours):
     """Score a contiguous run of hourly sample times, in order. Returns a dict of arrays."""
     sess = _session()
     pads = list(mc.SITES)
-    rec = {"t": [], "status": [], "red": [], "yel": [], "sat": [], "wind": [], "satup": []}
+    rec = {"t": [], "status": [], "red": [], "yel": [], "sat": [], "wind": [], "satup": [], "feat": []}
     acc = None
     z0, z0_t, prev_att, prev_t = None, None, None, None
     skipped = []
@@ -337,6 +345,23 @@ def score_hours(hours):
             status, red, yel, cls, top, diag = mc.evaluate(F, zz, la, lo, history, None, sep, None, sat)
             prev_att, prev_t = (cls == 6), t
 
+            from scipy.ndimage import distance_transform_edt as _edt
+            dlat_km, dlon_km = mc._spacing(la, lo)
+            ji = [(int(np.argmin(np.abs(la - mc.SITES[n_][0]))), int(np.argmin(np.abs(lo - mc.SITES[n_][1]))))
+                  for n_ in pads]
+            fv = np.full((len(pads), len(FEAT_NAMES)), 255, np.uint8)
+            for q, key in enumerate(FEAT_DIST):
+                msk = diag["feat"][key]
+                if msk.any():
+                    dist = _edt(~msk, sampling=(dlat_km, dlon_km)) / 1.852
+                    for p_, (j_, i_) in enumerate(ji):
+                        v_ = dist[j_, i_]
+                        fv[p_, q] = 255 if v_ > 25.4 else int(np.ceil(v_ * 10 - 1e-6))
+            mr = diag["feat"]["mrr1"]
+            for p_, (j_, i_) in enumerate(ji):
+                fv[p_, -1] = int(np.clip(np.round(max(float(mr[j_, i_]), 0.0) * 2), 0, 254))
+            rec["feat"].append(fv)
+
             st, rb, yb = [], [], []
             for name in pads:
                 plat, plon = mc.SITES[name]
@@ -396,7 +421,7 @@ def main():
     else:
         with mp.get_context("spawn").Pool(len(chunks)) as pool:
             parts = pool.map(score_hours, chunks)
-    rec = {"t": [], "status": [], "red": [], "yel": [], "sat": [], "wind": [], "satup": []}
+    rec = {"t": [], "status": [], "red": [], "yel": [], "sat": [], "wind": [], "satup": [], "feat": []}
     acc, skipped = None, []
     for p in parts:
         for key in rec:
@@ -422,6 +447,8 @@ def main():
         skipped=np.array([f"{a_} {b_}" for a_, b_ in skipped]),
         sat=np.array(rec["sat"], bool), wind=np.array(rec["wind"], bool),
         satup=np.array(rec["satup"], np.int32),
+        feat=(np.stack(rec["feat"]) if rec["feat"] else np.zeros((0, len(mc.SITES), len(FEAT_NAMES)), np.uint8)),
+        feat_names=np.array(FEAT_NAMES),
         classifier=np.array(mc.VIEWER_VERSION_EXPECTED), hours_planned=np.array(len(hours)))
     logging.info(f"{a.month}: {len(rec['t'])} of {len(hours)} hours scored, {len(skipped)} skipped, "
                  f"{time.monotonic() - t0:.0f} s -> {path}")
