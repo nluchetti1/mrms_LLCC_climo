@@ -90,7 +90,8 @@ jobs:
         run: |
           if [ -f _checks.py ]; then python _checks.py climo_run.py && python _checks.py mrms_classify.py; fi
       # Four processes on the runner's four cores, each a contiguous quarter of the month so the
-      # detached-anvil history still runs in order. Roughly 40 minutes per month.
+      # detached-anvil history still runs in order. Roughly 40 minutes per month for MRMS, plus
+      # ~3-5 s per hour for GLM (~90 twenty-second files): ~1.5 h per month.
       - name: Score ${{ matrix.month }}
         run: python climo_run.py ${{ matrix.month }} --procs 4 --out out
       - uses: actions/upload-artifact@v4
