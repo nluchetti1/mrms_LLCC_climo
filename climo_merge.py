@@ -141,6 +141,7 @@ def main():
     map_n = np.zeros((12, 24), np.int64)
     map_red = None
     coverage, classifiers, years = {}, set(), set()
+    glm_months = False
     first = last = None
     for f in files:
         z = np.load(f, allow_pickle=False)
@@ -165,6 +166,9 @@ def main():
         ym = os.path.basename(f)[:6]
         coverage[ym] = {"scored": int(len(z["t"])), "planned": int(z["hours_planned"]),
                         "skipped": int(len(z["skipped"]))}
+        if "glm" in z.files:            # GLM total lightning: hours where it was complete enough to use
+            glm_months = True
+            coverage[ym]["glm"] = int(z["glm"].sum())
         if "sat" in z.files:
             coverage[ym]["sat"] = int(z["sat"].sum()); coverage[ym]["wind"] = int(z["wind"].sum())
             coverage[ym]["satup"] = int((z["satup"] > 0).sum())
@@ -391,8 +395,12 @@ def main():
         "map": {"ny": int(ny), "nx": int(nx), "months": 12, "hours": 24,
                 "samples": map_n.tolist()},
         "domain": domain, "coverage": coverage,
-        "notes": ["Lightning is NLDN cloud-to-ground only - intracloud-only lightning is missed, "
-                  "so the lightning rule is undercounted.",
+        "notes": [("Lightning is NLDN cloud-to-ground plus GOES GLM total lightning (intracloud and "
+                   "cloud-to-cloud flashes as well), the 30 minutes before each sample. Hours whose "
+                   "GLM files were incomplete use NLDN alone (see Coverage); GLM locates flashes to "
+                   "~8 km, coarser than NLDN." if glm_months else
+                   "Lightning is NLDN cloud-to-ground only - intracloud-only lightning is missed, "
+                   "so the lightning rule is undercounted."),
                   "Isotherm heights come from the MRMS model freezing level and an assumed lapse "
                   "rate; historical BUFKIT soundings are not available.",
                   "Anvil exception part (a) uses the 0 C slice, not measured echo bases.",
