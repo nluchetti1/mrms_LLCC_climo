@@ -212,7 +212,7 @@
 </div>
 
 <script>
-const VIEWER_VERSION = "climo-v5";
+const VIEWER_VERSION = "climo-v6";
 const DAYS = 365, HOURS = 24;
 const CUM = [0,31,59,90,120,151,181,212,243,273,304,334];
 const MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
@@ -640,11 +640,13 @@ function drawCov(){
   Object.entries(M.coverage).forEach(([ym, c]) => { const y = ym.slice(0, 4);
     yrs[y] = yrs[y] || {s: 0, p: 0, sat: 0, wind: 0, has: false};
     yrs[y].s += c.scored; yrs[y].p += c.planned;
+    if (c.glm != null){ yrs[y].g = (yrs[y].g || 0) + c.glm; yrs[y].hasG = true; }
     if (c.sat != null){ yrs[y].sat += c.sat; yrs[y].wind += c.wind; yrs[y].has = true; } });
   const pct = (a, b) => Math.round(100 * a / Math.max(b, 1));
   $("cov").innerHTML = Object.entries(yrs).map(([y, c]) =>
     `<dt>${y}</dt><dd>${c.s.toLocaleString()} of ${c.p.toLocaleString()} hours (${pct(c.s, c.p)}%)` +
-    (c.has ? `<br><span style="color:var(--dim)">satellite tops ${pct(c.sat, c.s)}% · anvil winds ${pct(c.wind, c.s)}%</span>` : "") +
+    (c.has ? `<br><span style="color:var(--dim)">satellite tops ${pct(c.sat, c.s)}% · anvil winds ${pct(c.wind, c.s)}%` +
+      (c.hasG ? ` · GLM lightning ${pct(c.g, c.s)}%` : "") + `</span>` : "") +
     `</dd>`).join("");
 }
 
